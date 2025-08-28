@@ -1135,6 +1135,7 @@ struct CollectiveMainloopFwdSm90 {
             cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
         }
 
+        // TONY: WE SHOULD disable this for first version
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
@@ -1262,6 +1263,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
+                // TONY: skip this (QK)
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
@@ -1280,7 +1282,10 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
+                // TONY: This is where the row maximum is computed (this is the first stage of the online softmax algorithm)
+                //.    : Instead of computing the entire softmax on this line, we just search for the row maximum
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                // If do_pv is false, we can skip everything below (pretty much)
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
@@ -1293,6 +1298,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
+                // TONY: this is P time V
                 if constexpr (!MmaPV_use_RS_WG1) {
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
@@ -1321,8 +1327,10 @@ struct CollectiveMainloopFwdSm90 {
                 seqlen_info, m_block, n_block_min, params.window_size_left,
                 params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
+            // (i think) the following loop, loops over the number of k tiles
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                // if (do_pv_global[i] == false) {continue};
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention

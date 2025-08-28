@@ -94,12 +94,13 @@ struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
-    float const softmax_scale_log2;
+    float const softmax_scale_log2; // (log2(e) * 1/sqrt(128)) * q_dequant * k_dequant
 
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
 
+    // TONY: acc_s is Q times K for one tile
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
-    __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) {
+    __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) { // pass in a bool ref
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
@@ -111,6 +112,14 @@ struct Softmax {
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
             flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+            // TONY: at this point we should have the row_max
+            // float diff_max = scores_max_prev(mi) - row_max(mi); // compute the difference between prev max and curr max
+            // float THR = -7.0f; // tunable parameter (trivial)
+            // bool do_pv = diff_max > THR;
+            // broadcast this value between the entire warpgroup
+            // do_pv = __syncthreads_or(mask, do_pv); // this does it for the entire block
+            // save do_pv to data structure, for use in the next time step
+            // if (do_pv) {
             #pragma unroll
             for (int mi = 0; mi < size(row_max); ++mi) {
                 float scores_max_cur = !Check_inf
@@ -119,6 +128,7 @@ struct Softmax {
                 scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
                 row_sum(mi) *= scores_scale(mi);
             }
+            // }
         }
         return scores_scale;
     };
