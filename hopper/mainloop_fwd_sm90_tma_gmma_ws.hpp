@@ -4,6 +4,17 @@
 
 #pragma once
 
+// This file implements the mainloop for Flash Attention forward pass on SM90 (Hopper) architecture
+// It uses TMA (Tensor Memory Accelerator) and GMMA (General Matrix Multiply-Accumulate) instructions
+// The implementation supports various features like:
+// - Causal and local attention masking
+// - Variable sequence lengths (varlen)
+// - Paged KV cache
+// - Grouped Query Attention (GQA) with packed layout
+// - FP8 precision support
+// - Rotary positional embeddings
+// - Softmax capping
+
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
@@ -28,6 +39,27 @@ namespace flash {
 
 using namespace cute;
 
+// Main collective mainloop class for Flash Attention forward pass
+// Template parameters:
+// - Stages: Number of pipeline stages for overlapping compute and memory operations
+// - ClusterShape_: Shape of the cluster (multiple thread blocks working together)
+// - TileShape_MNK_: Tile dimensions for matrix multiply (M=seq_len_q, N=seq_len_k, K=head_dim)
+// - kHeadDimV: Head dimension for the V matrix (can differ from Q/K head dimension)
+// - Element_: Data type for Q/K/V tensors (e.g., fp16, bf16, fp8)
+// - ElementAccum_: Accumulation data type for intermediate computations
+// - ArchTag_: Target GPU architecture tag
+// - Is_causal_: Whether to apply causal masking (lower triangular attention pattern)
+// - Is_local_: Whether to apply local/sliding window attention
+// - Has_softcap_: Whether to apply tanh softmax capping for numerical stability
+// - Varlen_: Whether sequences have variable lengths (packed format)
+// - PagedKVNonTMA_: Whether to use paged KV cache without TMA
+// - AppendKV_: Whether to append new K/V tokens to existing cache
+// - HasQv_: Whether there's a separate Qv tensor for different output projection
+// - MmaPV_is_RS: Whether P@V multiplication uses register-shared memory layout
+// - IntraWGOverlap: Whether to overlap computation within warp groups
+// - PackGQA_: Whether to use packed layout for Grouped Query Attention
+// - Split_: Whether to use sequence parallelism (split attention computation)
+// - V_colmajor_: Whether V matrix is stored in column-major layout
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
@@ -36,11 +68,14 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kStages = Stages;
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
+    // Tile shape for P@V multiplication (M=seq_q, N=head_dim_v, K=seq_k)
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
+    // Tile shape for Q@V multiplication when HasQv is true
     using TileShape_MNK_QV = Shape<decltype(get<0>(TileShape_MNK{})), decltype(get<1>(TileShape_MNK{})), Int<kHeadDimV>>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
+    // Check if using FP8 data types (either E4M3 or E5M2)
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
@@ -52,8 +87,11 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
+    // For FP8 with row-major V, we need to transpose V in shared memory
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    // Use TMA (Tensor Memory Accelerator) for Q unless using packed GQA layout
     static constexpr bool Use_TMA_Q = !PackGQA;
+    // Use TMA for K/V unless using paged KV cache without TMA
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
@@ -586,6 +624,18 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
+    // Main load function: responsible for loading Q, K, V data from global memory to shared memory
+    // This function handles the producer side of the producer-consumer pipeline
+    // It loads data for multiple tiles (blocks) of K and V to enable tiled attention computation
+    // Parameters:
+    // - params: kernel parameters containing tensor pointers and shapes
+    // - pipeline_k/v/vt: pipelines for coordinating K, V, and transposed V data movement
+    // - smem_pipe_write: current pipeline stage for writing to shared memory
+    // - shared_storage: shared memory storage for tiles
+    // - scheduler_prefetch: callback for work scheduling
+    // - seqlen_info: sequence length information for variable-length sequences
+    // - block_coord: current block coordinates (m_block, head, batch, split)
+    // - work_idx: current work iteration index
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
