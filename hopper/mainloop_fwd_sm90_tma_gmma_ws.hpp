@@ -2106,6 +2106,7 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             // question: if both warpgroups do this, why can't we use fwd_step?
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+            // does smem_pipe_has_read has the same value for both warpgroups here?
             consumer_wait(pipeline_k, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
